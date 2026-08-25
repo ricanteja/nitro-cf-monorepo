@@ -1,0 +1,4 @@
+node_modules
+.wrangler
+# Python: prettier has no parser for it, and it is formatted to PEP 8 by hand.
+container/detect.py

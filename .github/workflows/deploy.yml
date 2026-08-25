@@ -1,0 +1,273 @@
+name: Deploy production
+
+# Same ordering constraint as the preview workflow: board and imgman must exist
+# before web, because web's bindings name them.
+#
+# Unlike a preview, this does NOT create infrastructure. Production D1 and R2
+# are made once, by hand, and their identifiers live in repository variables —
+# see README.md § Deploying your own fork. CI that can conjure production
+# storage is CI that can quietly conjure a second copy of it.
+
+on:
+  workflow_call:
+    inputs:
+      board:
+        required: false
+        default: true
+        type: boolean
+      imgman:
+        required: false
+        default: true
+        type: boolean
+      web:
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  # Is this repository configured to deploy anything at all?
+  #
+  # A fresh fork has neither the token nor the account id, and without this
+  # check every push to main produces a red X naming an authentication failure,
+  # which is the symptom rather than the cause. Deploying is opt-in: say so once
+  # and skip. See README.md § Deploying your own fork.
+  configured:
+    name: Prepare production
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+      prefix: ${{ steps.setup.outputs.prefix }}
+      account_id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      production_zone: ${{ steps.setup.outputs.production_zone }}
+      d1_id: ${{ steps.d1.outputs.id }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+        id: setup
+
+      - id: check
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ACCOUNT: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          ZONE: ${{ steps.setup.outputs.production_zone }}
+        run: |
+          missing=""
+          [ -z "$TOKEN" ] && missing="$missing secret:CLOUDFLARE_API_TOKEN"
+          [ -z "$ACCOUNT" ] && missing="$missing var:CLOUDFLARE_ACCOUNT_ID"
+          if [ -n "$missing" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::not configured to deploy —$missing. Nothing was deployed; see README.md § Deploying your own fork."
+            exit 0
+          fi
+          # A custom domain writes a worker route, which is a ZONE permission
+          # and not one the account-level checks cover. Without it the worker
+          # uploads and the domain attach fails afterwards, leaving production
+          # deployed and unreachable. Checked here, before anything is built.
+          if [ -n "${ZONE:-}" ]; then
+            curl -s -o /tmp/zone.json "https://api.cloudflare.com/client/v4/zones?name=${ZONE}" \
+              -H "Authorization: Bearer ${TOKEN}"
+            ZONE_ID=$(jq -r '.result[0].id // empty' /tmp/zone.json)
+            if [ -z "$ZONE_ID" ]; then
+              echo "ready=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::the API token cannot see zone '${ZONE}' — it needs 'Zone · Zone · Read'. Nothing was deployed."
+              exit 0
+            fi
+            CODE=$(curl -s -o /tmp/routes.json -w '%{http_code}' \
+              "https://api.cloudflare.com/client/v4/zones/${ZONE_ID}/workers/routes" \
+              -H "Authorization: Bearer ${TOKEN}")
+            if [ "$CODE" != "200" ]; then
+              jq -c '.errors // .' /tmp/routes.json 2>/dev/null || cat /tmp/routes.json
+              echo "ready=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::the API token can see zone '${ZONE}' but not its worker routes — add 'Zone · Workers Routes · Edit' for it. Nothing was deployed."
+              exit 0
+            fi
+            echo "Zone ${ZONE}: routes writable"
+          fi
+
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      # PRODUCTION STORAGE IS CREATED THE SAME WAY A PREVIEW'S IS.
+      #
+      # This used to be a manual step, on the reasoning that CI which can
+      # conjure production storage can quietly conjure a second copy of it. That
+      # argument does not survive contact with the fact that preview.yml already
+      # creates a database and a bucket on every pull request: the capability is
+      # identical, and the only thing the manual step added was a variable
+      # holding a uuid that had to be kept in agreement with a name.
+      #
+      # It is not a real safeguard either. Both steps here are create-or-REUSE
+      # and neither can delete anything, so the worst a bug can do is find what
+      # is already there. Nothing in this pipeline drops production data.
+      - name: Production D1 database
+        id: d1
+        if: steps.check.outputs.ready == 'true'
+        working-directory: web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # THE NAME COMES FROM THE CONFIG, NOT FROM THIS FILE.
+          #
+          # A throwaway copy with the placeholders filled in, read back through
+          # wrangler's own parser. Rebuilding the name here instead would put a
+          # second copy of the naming convention in a shell script, where it
+          # could drift from the binding the worker actually deploys with.
+          # `[[D1_ID]]` is pre-filled with a dummy because the id is what this
+          # step is about to work out; nothing is deployed from this copy.
+          sed 's/\[\[D1_ID\]\]/00000000-0000-0000-0000-000000000000/g' wrangler.jsonc > /tmp/names.jsonc
+          ../scripts/wrangler-env.sh /tmp/names.jsonc "${{ steps.setup.outputs.prefix }}" "" "" "${{ steps.setup.outputs.production_zone }}" >/dev/null
+          NAME=$(node ../scripts/resource-name.mjs /tmp/names.jsonc prod d1)
+          echo "Production database: $NAME"
+
+          # Wrangler prints its banner on STDOUT, so a failed `--json` call
+          # hands jq something that is not JSON and the first thing anyone sees
+          # is `jq: parse error`. Check that it parses before believing it.
+          LIST=$(pnpm --silent wrangler d1 list --json 2>&1) || true
+          if ! echo "$LIST" | jq -e . >/dev/null 2>&1; then
+            echo "$LIST"
+            echo "::error::could not list D1 databases — the output above is wrangler's. A 10000 here means the API token is missing 'Account · D1 · Edit'."
+            exit 1
+          fi
+          EXISTING=$(echo "$LIST" | jq -r --arg n "$NAME" '.[] | select(.name == $n) | .uuid')
+          if [ -n "$EXISTING" ]; then
+            echo "Reusing $NAME"
+            echo "id=$EXISTING" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! OUT=$(pnpm --silent wrangler d1 create "$NAME" 2>&1); then
+            echo "$OUT"
+            echo "::error::failed to create production database $NAME"
+            exit 1
+          fi
+          ID=$(echo "$OUT" | grep -oE '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}' | head -1)
+          if [ -z "$ID" ]; then
+            echo "$OUT"
+            echo "::error::could not read the new database id out of wrangler's output"
+            exit 1
+          fi
+          echo "Created $NAME"
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Production R2 bucket
+        if: steps.check.outputs.ready == 'true'
+        working-directory: web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          NAME=$(node ../scripts/resource-name.mjs /tmp/names.jsonc prod r2)
+          echo "Production bucket: $NAME"
+          EXISTS=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${NAME}" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq -r '.success')
+          if [ "$EXISTS" = "true" ]; then
+            echo "Reusing $NAME"
+            exit 0
+          fi
+
+          # ONE ATTEMPT, NO RETRY. Bucket create/delete is rate limited per
+          # ACCOUNT, so retrying a 10429 pushes the cooldown further out instead
+          # of recovering. Re-running the job is the recovery.
+          if ! OUT=$(pnpm --silent wrangler r2 bucket create "$NAME" 2>&1); then
+            echo "$OUT"
+            if echo "$OUT" | grep -q '10429'; then
+              echo "::error::$NAME: rate limited. Bucket operations share one account-wide budget; wait for it to recover and re-run."
+            else
+              echo "::error::failed to create production bucket $NAME"
+            fi
+            exit 1
+          fi
+          echo "Created $NAME"
+
+  services:
+    name: Deploy ${{ matrix.name }}
+    needs: configured
+    if: needs.configured.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: board
+            directory: services/board
+          - name: imgman
+            directory: services/imgman
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+        id: setup
+
+      - name: Skip if unchanged
+        id: gate
+        run: |
+          if [ "${{ matrix.name }}" = "board" ]; then want="${{ inputs.board }}"; else want="${{ inputs.imgman }}"; fi
+          echo "run=$want" >> "$GITHUB_OUTPUT"
+          [ "$want" = "true" ] || echo "::notice::${{ matrix.name }} unchanged, skipping deploy"
+
+      # The production database id goes through `env`, not inline. A `${{ }}`
+      # substituted straight into a run block is rendered into the workflow log,
+      # and on a public repository those logs are readable by anyone. Variables
+      # are not masked the way secrets are, so this identifier would otherwise
+      # be published on every deploy.
+      - name: Configure environment
+        if: steps.gate.outputs.run == 'true'
+        working-directory: ${{ matrix.directory }}
+        env:
+          PREFIX: ${{ steps.setup.outputs.prefix }}
+          D1_PROD_ID: ${{ needs.configured.outputs.d1_id }}
+          ZONE: ${{ steps.setup.outputs.production_zone }}
+        run: |
+          ../../scripts/wrangler-env.sh wrangler.jsonc "$PREFIX" "" "$D1_PROD_ID" "$ZONE"
+
+      - name: Deploy
+        if: steps.gate.outputs.run == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: ${{ matrix.directory }}
+          command: deploy --env prod
+
+  web:
+    name: Deploy web
+    needs: [configured, services]
+    if: ${{ !cancelled() && needs.configured.outputs.ready == 'true' && needs.services.result == 'success' && inputs.web }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+        id: setup
+
+      - name: Build preset
+        run: pnpm --filter nitro-cloudflare-monorepo build
+
+      - name: Configure environment
+        working-directory: web
+        env:
+          PREFIX: ${{ steps.setup.outputs.prefix }}
+          D1_PROD_ID: ${{ needs.configured.outputs.d1_id }}
+          ZONE: ${{ steps.setup.outputs.production_zone }}
+        run: |
+          ../scripts/wrangler-env.sh wrangler.jsonc "$PREFIX" "" "$D1_PROD_ID" "$ZONE"
+
+      - name: Apply migrations
+        working-directory: web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm --silent wrangler d1 migrations apply DB --remote --env prod
+
+      - name: Build
+        working-directory: web
+        run: pnpm build
+
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: web
+          command: deploy --env prod

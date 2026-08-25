@@ -1,0 +1,66 @@
+{
+    "name": "nitro-cloudflare-monorepo",
+    "version": "0.1.0",
+    "description": "Nitro preset that runs a Nuxt/Nitro app and its sibling Cloudflare Workers — Durable Objects, containers and service-bound workers — inside a single Miniflare instance for local development.",
+    "license": "MIT OR Apache-2.0",
+    "author": "Ricardo Tejada - Tenologik Ltd. Co.",
+    "type": "module",
+    "keywords": [
+        "nitro",
+        "nitropack",
+        "nuxt",
+        "cloudflare",
+        "workers",
+        "miniflare",
+        "wrangler",
+        "monorepo",
+        "durable-objects",
+        "containers"
+    ],
+    "exports": {
+        ".": {
+            "import": "./dist/index.mjs"
+        },
+        "./preset": {
+            "import": "./dist/preset.mjs"
+        }
+    },
+    "main": "./dist/index.mjs",
+    "files": [
+        "dist"
+    ],
+    "scripts": {
+        "build": "unbuild",
+        "dev": "unbuild --stub",
+        "lint": "eslint .",
+        "lint:fix": "eslint . --fix",
+        "prettier:check": "prettier --check .",
+        "prettier:write": "prettier --write .",
+        "typecheck": "tsc --noEmit"
+    },
+    "dependencies": {
+        "defu": "^6.1.4",
+        "pathe": "^2.0.3"
+    },
+    "peerDependencies": {
+        "h3": "^1.10.0 || ^2.0.0",
+        "miniflare": "^4.0.0",
+        "nitropack": "^2.11.0",
+        "wrangler": "^4.0.0"
+    },
+    "devDependencies": {
+        "@cloudflare/workers-types": "^5.20260820.1",
+        "@types/node": "^25.6.0",
+        "@eslint/js": "^9.39.2",
+        "esbuild": "^0.28.0",
+        "eslint": "^9.39.2",
+        "jiti": "^2.6.1",
+        "miniflare": "^4.20260430.0",
+        "nitropack": "^2.11.12",
+        "prettier": "^3.8.3",
+        "typescript": "^5.9.0",
+        "typescript-eslint": "^8.59.1",
+        "unbuild": "^3.5.0",
+        "wrangler": "^4.87.0"
+    }
+}

@@ -1,0 +1,36 @@
+# Workspace layout.
+#
+#   packages/  — reusable infrastructure. The Nitro preset lives here, and is
+#                consumed by `web` via `workspace:*`.
+#   web/       — the Nuxt application (Skein, the demo board).
+#   services/  — one directory per Cloudflare Worker that is NOT the Nuxt app:
+#                Durable Objects, container-backed services, and plain workers
+#                reached over service bindings.
+#
+# Container build contexts that carry their own package.json (e.g.
+# services/imgman/container) are added here as they are created.
+packages:
+  - 'packages/*'
+  - 'web'
+  - 'services/*'
+
+# pnpm 10 blocks dependency build scripts by default. These two are declared
+# ignored rather than approved because neither needs its postinstall: esbuild
+# and workerd both ship their binaries as platform-specific optional packages
+# (@esbuild/linux-x64, @cloudflare/workerd-linux-64), so the script has nothing
+# left to fetch. Verified locally — esbuild bundles, and Miniflare boots workerd
+# and round-trips D1 and R2 — with both scripts blocked.
+#
+# Declaring them does NOT silence pnpm's "Ignored build scripts" notice; pnpm
+# reports what it skipped either way. What it buys is a recorded, reviewed
+# decision instead of an implicit default, so `pnpm install` resolves the same
+# way here and in CI and nobody is tempted to run `pnpm approve-builds` and
+# quietly change the install.
+ignoredBuiltDependencies:
+  - esbuild
+  - workerd
+  # Pulled in through Nuxt's toolchain. Same reasoning: both resolve to
+  # prebuilt platform packages, and `nuxt dev` boots, server-renders and
+  # serves live D1 and R2 bindings with their scripts blocked.
+  - unrs-resolver
+  - vue-demi

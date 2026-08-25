@@ -1,0 +1,90 @@
+/**
+ * board — the live-collaboration Durable Object for one board.
+ *
+ * One instance per board, addressed with `idFromName(boardId)` so it can
+ * recover its own board id from `ctx.id.name` and hydrate itself from D1
+ * without the caller having to re-send it.
+ *
+ * NOT PUBLICLY ROUTABLE, in any environment. The browser's WebSocket reaches
+ * this object through the web app's `BOARD` binding: the app answers the
+ * upgrade above Nitro and hands the request to the object, so a 101 survives
+ * and no second hostname exists. See web/server/upgrade.ts.
+ *
+ * That is the same rule imgman follows, and it is the point of the preset —
+ * exactly one worker is addressable from outside, and everything else is
+ * reached the way Cloudflare intends.
+ *
+ * See web/wrangler.jsonc for the naming and `[[PREFIX]]` conventions; the
+ * same rules apply here. Local development runs against this file untouched.
+ */
+{
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "skein-board-dev",
+    "main": "src/index.ts",
+    "compatibility_date": "2026-08-01",
+    "compatibility_flags": ["nodejs_compat"],
+    "observability": {
+        "enabled": true,
+    },
+    /**
+     * SQLite-backed, not the legacy key-value backend. The DO keeps live layout
+     * in its own embedded SQLite and flushes it to D1 on an alarm, so it needs
+     * `new_sqlite_classes` rather than `new_classes`.
+     */
+    "migrations": [
+        {
+            "tag": "v1",
+            "new_sqlite_classes": ["BoardRoom"],
+        },
+    ],
+    "durable_objects": {
+        "bindings": [
+            {
+                "name": "BOARD",
+                "class_name": "BoardRoom",
+            },
+        ],
+    },
+    /**
+     * The DO writes layout back to the same database the web app reads. In
+     * local development both workers resolve this to one Miniflare-backed
+     * database, because the preset gives every worker the same persist root.
+     */
+    "d1_databases": [
+        {
+            "binding": "DB",
+            "database_name": "skein-dev",
+            "database_id": "00000000-0000-0000-0000-000000000000",
+        },
+    ],
+    "env": {
+        "pr-[[PR_NUM]]": {
+            "name": "ws-[[PREFIX]]-board-pr-[[PR_NUM]]",
+            "workers_dev": false,
+            "durable_objects": {
+                "bindings": [{ "name": "BOARD", "class_name": "BoardRoom" }],
+            },
+            "d1_databases": [
+                {
+                    "binding": "DB",
+                    "database_name": "d1-[[PREFIX]]-pr-[[PR_NUM]]",
+                    "database_id": "[[D1_ID]]",
+                },
+            ],
+        },
+        "prod": {
+            "name": "ws-[[PREFIX]]-board-prod",
+            "workers_dev": false,
+            "durable_objects": {
+                "bindings": [{ "name": "BOARD", "class_name": "BoardRoom" }],
+            },
+            "d1_databases": [
+                {
+                    "binding": "DB",
+                    "database_name": "d1-[[PREFIX]]-prod",
+                    "database_id": "[[D1_ID]]",
+                },
+            ],
+        },
+    },
+}

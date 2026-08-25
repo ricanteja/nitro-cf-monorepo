@@ -1,0 +1,76 @@
+name: Quality
+
+# One reusable job, called once per project. The projects differ only in which
+# directory they run in and whether they need the preset built first, so this
+# is parameterised rather than copied — four near-identical workflow files
+# drift the moment one of them is fixed and the others are not.
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: Display name for the project.
+        required: true
+        type: string
+      directory:
+        description: Path to the package.
+        required: true
+        type: string
+      needs_preset:
+        description: >-
+          Build the monorepo preset before checking. Only the Nuxt app consumes
+          it, and it is loaded from dist/, so its checks fail without this.
+        required: false
+        default: false
+        type: boolean
+      prepare:
+        description: Optional command to run in the package before checks.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: ${{ inputs.name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+
+      - name: Build preset
+        if: inputs.needs_preset
+        run: pnpm --filter nitro-cloudflare-monorepo build
+
+      # Interpolated straight into the script, unlike the expressions in
+      # pullrequest.yml which go through `env`. The distinction is the source:
+      # workflow_call inputs are set by a sibling workflow file in this repo and
+      # are exactly as trustworthy as it is, whereas anything derived from a PR
+      # — titles, branch names, bodies — is attacker-controlled and must never
+      # reach a shell this way.
+      - name: Prepare
+        if: inputs.prepare != ''
+        working-directory: ${{ inputs.directory }}
+        run: ${{ inputs.prepare }}
+
+      # Run all three even when an earlier one fails: a formatting complaint
+      # should not hide a type error, and one run should surface everything
+      # that needs fixing rather than one thing per push.
+      - name: Format
+        id: format
+        working-directory: ${{ inputs.directory }}
+        run: pnpm prettier:check
+
+      - name: Lint
+        id: lint
+        if: ${{ !cancelled() }}
+        working-directory: ${{ inputs.directory }}
+        run: pnpm lint
+
+      - name: Typecheck
+        id: typecheck
+        if: ${{ !cancelled() }}
+        working-directory: ${{ inputs.directory }}
+        run: pnpm typecheck

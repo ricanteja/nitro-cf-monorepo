@@ -1,0 +1,48 @@
+{
+    "name": "skein-web",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "license": "MIT OR Apache-2.0",
+    "scripts": {
+        "dev": "nuxt dev",
+        "build": "nuxt build",
+        "preview": "nuxt preview",
+        "lint": "eslint .",
+        "lint:fix": "eslint . --fix",
+        "prettier:check": "prettier --check .",
+        "prettier:write": "prettier --write .",
+        "typecheck": "nuxt typecheck",
+        "db:migrate": "wrangler d1 migrations apply DB --local",
+        "seed": "node --experimental-strip-types scripts/seed.ts"
+    },
+    "dependencies": {
+        "@nuxt/ui": "^4.7.1",
+        "@pinia/nuxt": "^1.0.2",
+        "nitro-cloudflare-monorepo": "workspace:*",
+        "nuxt": "^4.4.4",
+        "pinia": "^4.0.3",
+        "vue": "^3.5.33"
+    },
+    "devDependencies": {
+        "@cloudflare/workers-types": "^5.20260820.1",
+        "@eslint/js": "^9.39.2",
+        "@iconify-json/lucide": "^1.2.126",
+        "@nuxt/eslint": "^1.15.2",
+        "@tailwindcss/vite": "^4.2.4",
+        "@types/node": "^25.6.0",
+        "chokidar": "^4.0.3",
+        "esbuild": "^0.28.0",
+        "eslint": "^9.39.2",
+        "eslint-plugin-vue": "^10.9.0",
+        "globals": "^17.5.0",
+        "jiti": "^2.6.1",
+        "miniflare": "^4.20260430.0",
+        "prettier": "^3.8.3",
+        "tailwindcss": "^4.2.4",
+        "typescript": "^5.9.0",
+        "typescript-eslint": "^8.59.1",
+        "vue-tsc": "^3.2.7",
+        "wrangler": "^4.87.0"
+    }
+}

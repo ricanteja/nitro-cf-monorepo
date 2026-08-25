@@ -1,0 +1,356 @@
+name: Preview environment
+
+# Creates (or refreshes) the per-PR preview environment.
+#
+# WHY THIS IS ONE WORKFLOW AND NOT THREE. The three workers are coupled by
+# their bindings: web names the board Durable Object via `script_name` and
+# reaches imgman over a service binding. Cloudflare rejects a deploy whose
+# `script_name` does not already exist ([10061]), so board and imgman must be
+# live before web is deployed. Splitting this per project would mean encoding
+# that ordering across workflow boundaries for no benefit — a preview is
+# created and destroyed as one unit.
+#
+# Everything here is IDEMPOTENT. It runs again on every push to the PR, so
+# creating a database that already exists has to be a no-op rather than an
+# error.
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  resources:
+    name: Create resources
+    runs-on: ubuntu-latest
+    outputs:
+      d1_id: ${{ steps.d1.outputs.id }}
+      prefix: ${{ steps.setup.outputs.prefix }}
+      account_id: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      subdomain: ${{ steps.subdomain.outputs.name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: ./.github/actions/setup
+        id: setup
+
+      # Fail with something actionable rather than a wall of wrangler output.
+      # A fork arrives here first, and "credentials are not configured" is a
+      # far better first experience than an auth error from an API call.
+      # Two checks, in order of how cheaply they fail.
+      #
+      # First that the values exist at all. Then that the token can actually
+      # SEE each service the preview is about to use — because a token missing
+      # one permission otherwise fails several minutes later, in the middle of
+      # provisioning, with whatever error the tool in use happens to produce.
+      # Three reads take a second and name the missing one.
+      - name: Check credentials
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ACCOUNT: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          missing=0
+          [ -z "$TOKEN" ] && { echo "::error::secret CLOUDFLARE_API_TOKEN is not set"; missing=1; }
+          [ -z "$ACCOUNT" ] && { echo "::error::variable CLOUDFLARE_ACCOUNT_ID is not set"; missing=1; }
+          if [ "$missing" = "1" ]; then
+            echo "::error::See README.md § Deploying your own fork for the required token scopes."
+            exit 1
+          fi
+
+          # A READ proving possible does not prove Edit is granted, so this
+          # catches a permission that was never added — the common mistake —
+          # and not one added at the wrong level. The create step says so if it
+          # gets that far.
+          probe() {
+            code=$(curl -s -o /tmp/probe.json -w '%{http_code}' \
+              "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}/$2" \
+              -H "Authorization: Bearer ${TOKEN}")
+            if [ "$code" = "200" ]; then
+              echo "  $1: reachable"
+              return 0
+            fi
+            # Cloudflare's own code and message, which say more than the status
+            # does: 9109 is a permission the token does not hold, 10000 covers
+            # a token that was not accepted at all. Printing only "HTTP 401"
+            # sent somebody to check a permission that was already granted.
+            echo "  $1: HTTP $code"
+            jq -c '.errors // .' /tmp/probe.json 2>/dev/null || cat /tmp/probe.json
+            echo "::error::the API token cannot read $1 (HTTP $code) — see the response above. If it names a missing permission, add '$3'; if it says the token is invalid, the secret in GitHub is not the token you edited."
+            return 1
+          }
+
+          # Which token is this? The id is printable and lets you match it
+          # against the one you edited in the dashboard — the failure mode this
+          # cannot otherwise distinguish is a GitHub secret holding an OLDER
+          # token than the one you fixed.
+          # Account-owned and user-owned tokens verify at different endpoints;
+          # ask both rather than reporting "could not verify" for a token that
+          # is merely the other kind.
+          for endpoint in "accounts/${ACCOUNT}/tokens/verify" "user/tokens/verify"; do
+            id=$(curl -s "https://api.cloudflare.com/client/v4/${endpoint}" \
+              -H "Authorization: Bearer ${TOKEN}" | jq -r '.result.id // empty')
+            [ -n "$id" ] && break
+          done
+          echo "token id: ${id:-could not verify}"
+
+
+          denied=0
+          probe "D1"      "d1/database"      "Account · D1 · Edit"                 || denied=1
+          probe "R2"      "r2/buckets"       "Account · Workers R2 Storage · Edit" || denied=1
+          probe "Workers" "workers/scripts"  "Account · Workers Scripts · Edit"    || denied=1
+          [ "$denied" = "0" ] || exit 1
+
+      - name: Create D1 database
+        id: d1
+        working-directory: web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # THE NAME COMES FROM THE CONFIG, NOT FROM THIS FILE.
+          #
+          # A throwaway copy with the placeholders filled in, read back through
+          # wrangler's own parser. Rebuilding the name here instead would put a
+          # second copy of the naming convention in a shell script, where it
+          # could drift from the binding the worker actually deploys with.
+          # `[[D1_ID]]` is pre-filled with a dummy because the id is what this
+          # step is about to work out; nothing is deployed from this copy.
+          sed 's/\[\[D1_ID\]\]/00000000-0000-0000-0000-000000000000/g' wrangler.jsonc > /tmp/names.jsonc
+          ../scripts/wrangler-env.sh /tmp/names.jsonc "${{ steps.setup.outputs.prefix }}" "${{ inputs.pr_number }}" "" "" >/dev/null
+          NAME=$(node ../scripts/resource-name.mjs /tmp/names.jsonc "pr-${{ inputs.pr_number }}" d1)
+          echo "Preview database: $NAME"
+
+          # Wrangler prints its banner on STDOUT, so a failed `--json` call
+          # hands jq something that is not JSON and the first thing anyone sees
+          # is `jq: parse error`, which names neither the command nor the cause.
+          # Check that it parses before believing it.
+          LIST=$(pnpm --silent wrangler d1 list --json 2>&1) || true
+          if ! echo "$LIST" | jq -e . >/dev/null 2>&1; then
+            echo "$LIST"
+            echo "::error::could not list D1 databases — the output above is wrangler's. A 10000 here means the API token is missing 'Account · D1 · Edit'."
+            exit 1
+          fi
+          EXISTING=$(echo "$LIST" | jq -r --arg n "$NAME" '.[] | select(.name == $n) | .uuid')
+
+          if [ -n "$EXISTING" ]; then
+            echo "Reusing $NAME ($EXISTING)"
+            echo "id=$EXISTING" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! OUT=$(pnpm --silent wrangler d1 create "$NAME" 2>&1); then
+            echo "$OUT"
+            if echo "$OUT" | grep -q '10000'; then
+              echo "::error::creating $NAME was refused. Code 10000 is an authentication error: the token can be read but cannot create databases, so 'Account · D1' is probably set to Read rather than Edit."
+            else
+              echo "::error::failed to create D1 database $NAME"
+            fi
+            exit 1
+          fi
+          ID=$(echo "$OUT" | grep -oE '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}' | head -1)
+          if [ -z "$ID" ]; then
+            echo "$OUT"
+            echo "::error::could not read the new database id out of wrangler's output"
+            exit 1
+          fi
+          echo "Created $NAME ($ID)"
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      # The account's workers.dev subdomain, read from the account rather than
+      # configured. Cloudflare already knows it and there is exactly one per
+      # account, so asking a fork to supply it only creates a way to get it
+      # wrong — and this one was got wrong: it was set to the resource prefix,
+      # and every pull request advertised a preview link to a host that did not
+      # exist. It is used only to write that link; wrangler works the deployed
+      # hostname out for itself.
+      - name: Resolve workers.dev subdomain
+        id: subdomain
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ACCOUNT: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          NAME=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT}/workers/subdomain" \
+            -H "Authorization: Bearer ${TOKEN}" | jq -r '.result.subdomain // empty')
+          if [ -z "$NAME" ]; then
+            echo "::error::could not read this account's workers.dev subdomain. The token needs 'Account · Workers Scripts · Read', which it already needs to deploy — so this failing usually means the credential is wrong rather than under-scoped."
+            exit 1
+          fi
+          echo "Account subdomain: ${NAME}.workers.dev"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Create R2 bucket
+        working-directory: web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          NAME=$(node ../scripts/resource-name.mjs /tmp/names.jsonc "pr-${{ inputs.pr_number }}" r2)
+          echo "Preview bucket: $NAME"
+          EXISTS=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${NAME}" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" | jq -r '.success')
+          if [ "$EXISTS" = "true" ]; then
+            echo "Reusing $NAME"
+            exit 0
+          fi
+
+          # ONE ATTEMPT, NO RETRY. Bucket create/delete is rate limited per
+          # ACCOUNT, and every attempt spends the same shared budget — so
+          # retrying a 10429 pushes the cooldown further out instead of
+          # recovering. Re-running the job is the recovery; the check above
+          # then finds the bucket and skips creation.
+          if ! OUT=$(pnpm --silent wrangler r2 bucket create "$NAME" 2>&1); then
+            echo "$OUT"
+            if echo "$OUT" | grep -q '10429'; then
+              echo "::error::$NAME: rate limited. Bucket operations share one account-wide budget; wait for it to recover and re-run."
+            elif echo "$OUT" | grep -qE '10000|9109'; then
+              echo "::error::$NAME: CLOUDFLARE_API_TOKEN was rejected — it needs Workers R2 Storage: Edit."
+            fi
+            exit 1
+          fi
+          echo "Created $NAME"
+
+      # Before any worker serves traffic, not after web deploys: the board
+      # Durable Object reads these tables too.
+      - name: Apply migrations
+        working-directory: web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          ../scripts/wrangler-env.sh wrangler.jsonc \
+            "${{ steps.setup.outputs.prefix }}" "${{ inputs.pr_number }}" "${{ steps.d1.outputs.id }}"
+          pnpm --silent wrangler d1 migrations apply DB --remote --env "pr-${{ inputs.pr_number }}"
+
+  services:
+    name: Deploy ${{ matrix.name }}
+    needs: resources
+    runs-on: ubuntu-latest
+    strategy:
+      # Independent of each other, and both must exist before web. One failing
+      # should not cancel the other — a partial preview is easier to diagnose
+      # than a cancelled one.
+      fail-fast: false
+      matrix:
+        include:
+          - name: board
+            directory: services/board
+          - name: imgman
+            directory: services/imgman
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: ./.github/actions/setup
+
+      - name: Configure environment
+        working-directory: ${{ matrix.directory }}
+        run: |
+          ../../scripts/wrangler-env.sh wrangler.jsonc \
+            "${{ needs.resources.outputs.prefix }}" "${{ inputs.pr_number }}" "${{ needs.resources.outputs.d1_id }}"
+
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: ${{ matrix.directory }}
+          command: deploy --env pr-${{ inputs.pr_number }}
+
+  web:
+    name: Deploy web
+    needs: [resources, services]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: ./.github/actions/setup
+
+      # The Nuxt build resolves the preset from dist/, so it has to be built
+      # before the app is.
+      - name: Build preset
+        run: pnpm --filter nitro-cloudflare-monorepo build
+
+      - name: Configure environment
+        working-directory: web
+        run: |
+          ../scripts/wrangler-env.sh wrangler.jsonc \
+            "${{ needs.resources.outputs.prefix }}" "${{ inputs.pr_number }}" "${{ needs.resources.outputs.d1_id }}"
+
+      - name: Build
+        working-directory: web
+        run: pnpm build
+
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: web
+          command: deploy --env pr-${{ inputs.pr_number }}
+
+  notify:
+    name: Comment on PR
+    needs: [resources, web]
+    if: ${{ !cancelled() && needs.web.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Updated in place rather than appended, so a PR with twenty pushes has
+      # one comment showing the current state instead of twenty stale ones.
+      - name: Upsert preview comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PREFIX: ${{ needs.resources.outputs.prefix }}
+          PR: ${{ inputs.pr_number }}
+          D1_ID: ${{ needs.resources.outputs.d1_id }}
+          SUBDOMAIN: ${{ needs.resources.outputs.subdomain }}
+        run: |
+          # Must match what wrangler-env.sh built, or the comment advertises a
+          # hostname nothing is serving — which is exactly the bug that made
+          # every preview link dead until somebody opened one.
+          HOST="ws-${PREFIX}-web-pr-${PR}.${SUBDOMAIN}.workers.dev"
+          MARKER="<!-- skein-preview -->"
+          BODY=$(cat <<EOF
+          ${MARKER}
+          ## Preview environment
+
+          **URL:** https://${HOST}
+
+          | Resource | Name | Reachable |
+          |---|---|---|
+          | Worker (web) | \`ws-${PREFIX}-web-pr-${PR}\` | the URL above |
+          | Worker (board) | \`ws-${PREFIX}-board-pr-${PR}\` | binding only |
+          | Worker (imgman) | \`ws-${PREFIX}-imgman-pr-${PR}\` | binding only |
+          | D1 | \`d1-${PREFIX}-pr-${PR}\` (\`${D1_ID}\`) | |
+          | R2 | \`r2-${PREFIX}-pr-${PR}\` | |
+
+          Everything above is destroyed when this PR closes.
+          The URL is public unless a Cloudflare Access application covers
+          \`*.${SUBDOMAIN}.workers.dev\` — see README.md § Protecting preview
+          URLs. One hostname is all there is: the WebSocket arrives on it too,
+          so a policy covers live collaboration rather than breaking it.
+          EOF
+          )
+
+          # per_page rather than --paginate: with --paginate the jq filter is
+          # applied to each page separately, so a busy PR yields several ids on
+          # separate lines instead of one. 100 is the API maximum and far more
+          # comments than a preview marker needs to be found among.
+          ID=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments?per_page=100" \
+            --jq "map(select(.body | contains(\"${MARKER}\"))) | .[0].id // empty")
+          if [ -n "$ID" ]; then
+            gh api -X PATCH "repos/${{ github.repository }}/issues/comments/${ID}" -f body="$BODY" >/dev/null
+            echo "Updated existing comment $ID"
+          else
+            gh api -X POST "repos/${{ github.repository }}/issues/${PR}/comments" -f body="$BODY" >/dev/null
+            echo "Created preview comment"
+          fi

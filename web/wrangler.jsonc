@@ -1,0 +1,187 @@
+/**
+ * Skein web — Cloudflare Workers configuration.
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ *
+ * NAMING. The top-level block is LOCAL DEVELOPMENT ONLY and deliberately
+ * carries no resource prefix. Miniflare's D1 and R2 live on this machine under
+ * .wrangler/state, so these names cannot collide with anything in a real
+ * Cloudflare account and nothing needs to make them unique.
+ *
+ * Deployed names DO need to be account-unique, so `prod` and the per-PR
+ * environment set `name` explicitly rather than letting wrangler derive it by
+ * appending the environment to the top-level name. Explicit is worth the two
+ * extra lines: it means the deployed name can be read straight off this file
+ * instead of being reconstructed in your head.
+ *
+ * PLACEHOLDERS. `[[PREFIX]]` and `[[PR_NUM]]` are substituted by CI before
+ * deploy (see .github/workflows/). `[[PREFIX]]` comes from `cloudflare.
+ * resourcePrefix` in the root package.json — the single place a fork changes
+ * to keep its resource names out of everyone else's namespace. They appear
+ * only inside deploy-time environments, never at the top level, so local
+ * development runs against this file untouched.
+ */
+{
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "skein-web-dev",
+    "main": ".output/server/index.mjs",
+    "compatibility_date": "2026-08-01",
+    "compatibility_flags": ["nodejs_compat"],
+    "observability": {
+        "enabled": true,
+    },
+    "assets": {
+        "binding": "ASSETS",
+        "directory": ".output/public",
+    },
+    /* Boards, the cards on them, the people found in those cards, and the
+       strings between them. */
+    "d1_databases": [
+        {
+            "binding": "DB",
+            "database_name": "skein-dev",
+            "database_id": "00000000-0000-0000-0000-000000000000",
+            "migrations_dir": "migrations",
+        },
+    ],
+    /* Uploaded originals and the derivatives the image container produces. */
+    "r2_buckets": [
+        {
+            "binding": "R2",
+            "bucket_name": "skein-dev",
+        },
+    ],
+    /**
+     * Live collaboration, served by the `board` worker.
+     *
+     * This binding is how the BROWSER reaches it too. The upgrade is answered
+     * by server/upgrade.ts above Nitro and passed to the object through here,
+     * which is why `board` has no hostname in any environment.
+     *
+     * A CROSS-SCRIPT binding: `script_name` points at a Durable Object class
+     * that lives in another worker. Cloudflare rejects a deploy whose
+     * `script_name` does not already exist ([10061]), so `board` must be
+     * deployed BEFORE this worker in every environment — see the ordering in
+     * .github/workflows/. Locally the preset sidesteps that entirely by
+     * loading both workers into one Miniflare instance.
+     */
+    "durable_objects": {
+        "bindings": [
+            {
+                "name": "BOARD",
+                "class_name": "BoardRoom",
+                "script_name": "skein-board-dev",
+            },
+        ],
+    },
+    /**
+     * Native image work. A SERVICE binding rather than a Durable Object one:
+     * we call its HTTP interface, and it has no public hostname of its own.
+     */
+    "services": [
+        {
+            "binding": "IMGMAN",
+            "service": "skein-imgman-dev",
+        },
+    ],
+    "env": {
+        /**
+         * Per-PR preview environment. Created and torn down by CI; see
+         * .github/workflows/web-staging.yml and web-cleanup.yml.
+         *
+         * `[[D1_ID]]` is filled in by CI after it creates the database, because
+         * a D1 binding needs the real uuid and that only exists once the
+         * database does. The same placeholder appears in `prod` below and is
+         * given a different value there — wrangler only reads the environment
+         * it is actually deploying, so the other block's value is inert.
+         */
+        "pr-[[PR_NUM]]": {
+            "name": "ws-[[PREFIX]]-web-pr-[[PR_NUM]]",
+            /**
+             * Preview hostname: `ws-<prefix>-web-pr-42.<subdomain>.workers.dev`.
+             *
+             * Deliberately NOT a custom domain. A `workers.dev` subdomain
+             * belongs to the account, so one Cloudflare Access application over
+             * `*.<subdomain>.workers.dev` protects every preview this
+             * repository will ever open, including ones for pull requests
+             * nobody has raised yet — where a Custom Domain would need a policy
+             * naming each hostname as it appears.
+             *
+             * Production is the opposite trade and lives on a real domain; see
+             * the `prod` block.
+             */
+            "workers_dev": true,
+            "d1_databases": [
+                {
+                    "binding": "DB",
+                    "database_name": "d1-[[PREFIX]]-pr-[[PR_NUM]]",
+                    "database_id": "[[D1_ID]]",
+                    "migrations_dir": "migrations",
+                },
+            ],
+            "r2_buckets": [
+                {
+                    "binding": "R2",
+                    "bucket_name": "r2-[[PREFIX]]-pr-[[PR_NUM]]",
+                },
+            ],
+            "durable_objects": {
+                "bindings": [
+                    {
+                        "name": "BOARD",
+                        "class_name": "BoardRoom",
+                        "script_name": "ws-[[PREFIX]]-board-pr-[[PR_NUM]]",
+                    },
+                ],
+            },
+            "services": [{ "binding": "IMGMAN", "service": "ws-[[PREFIX]]-imgman-pr-[[PR_NUM]]" }],
+        },
+        /* Production. */
+        "prod": {
+            "name": "ws-[[PREFIX]]-web-prod",
+            /**
+             * Production hostname: `<prefix>.<zone>`, a Custom Domain.
+             *
+             * Cloudflare treats `workers.dev` as a Free website and says plainly
+             * that it is not for business-critical traffic, so production gets a
+             * domain you own. Cloudflare creates the DNS record and the
+             * certificate and removes both if the domain is ever detached.
+             *
+             * EVERYTHING BETWEEN THE MARKERS is deleted by
+             * scripts/wrangler-env.sh when CLOUDFLARE_PROD_ZONE is unset, and
+             * production then publishes on workers.dev like the previews do —
+             * so a fork with no domain of its own still gets a working deploy.
+             * The markers delimit a RANGE rather than tagging each line because
+             * prettier reflows a long `routes` entry across several lines and a
+             * per-line marker would not survive it.
+             */
+            /*<zone*/
+            "workers_dev": false,
+            "routes": [{ "pattern": "[[PREFIX]].[[ZONE]]", "custom_domain": true }],
+            /*zone>*/
+            "d1_databases": [
+                {
+                    "binding": "DB",
+                    "database_name": "d1-[[PREFIX]]-prod",
+                    "database_id": "[[D1_ID]]",
+                    "migrations_dir": "migrations",
+                },
+            ],
+            "r2_buckets": [
+                {
+                    "binding": "R2",
+                    "bucket_name": "r2-[[PREFIX]]-prod",
+                },
+            ],
+            "durable_objects": {
+                "bindings": [
+                    {
+                        "name": "BOARD",
+                        "class_name": "BoardRoom",
+                        "script_name": "ws-[[PREFIX]]-board-prod",
+                    },
+                ],
+            },
+            "services": [{ "binding": "IMGMAN", "service": "ws-[[PREFIX]]-imgman-prod" }],
+        },
+    },
+}

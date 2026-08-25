@@ -1,0 +1,19 @@
+{
+    "semi": false,
+    "singleQuote": true,
+    "tabWidth": 4,
+    "useTabs": false,
+    "printWidth": 100,
+    "trailingComma": "es5",
+    "bracketSpacing": true,
+    "bracketSameLine": false,
+    "arrowParens": "always",
+    "endOfLine": "lf",
+    "overrides": [
+        {
+            "comment": "YAML is 2-space by universal convention, and GitHub workflows especially so. Without this the repo's tabWidth of 4 reformats every workflow into something that reads as wrong to anyone who has seen one before.",
+            "files": ["*.yml", "*.yaml"],
+            "options": { "tabWidth": 2 }
+        }
+    ]
+}

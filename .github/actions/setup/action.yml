@@ -1,0 +1,79 @@
+name: Setup workspace
+description: Node, pnpm, a warm store, and the repo's Cloudflare settings.
+
+outputs:
+  prefix:
+    description: cloudflare.resourcePrefix from the root package.json, lowercased.
+    value: ${{ steps.cloudflare.outputs.prefix }}
+  production_zone:
+    description: cloudflare.productionZone from the root package.json, or empty.
+    value: ${{ steps.cloudflare.outputs.production_zone }}
+
+runs:
+  using: composite
+  steps:
+    # No `version` input: pnpm/action-setup reads `packageManager` from the root
+    # package.json, so the version CI installs is the version the lockfile was
+    # written with, and there is one place to change it.
+    - uses: pnpm/action-setup@v5
+
+    # node-version-file rather than a literal, so .nvmrc stays the single
+    # place the Node version is declared and CI cannot drift from local dev.
+    - uses: actions/setup-node@v5
+      with:
+        node-version-file: .nvmrc
+        cache: pnpm
+        cache-dependency-path: pnpm-lock.yaml
+
+    # --frozen-lockfile is what makes CI a check rather than a moving target:
+    # a lockfile that does not match package.json fails here instead of
+    # silently resolving to something nobody has run locally.
+    - name: Install dependencies
+      shell: bash
+      run: pnpm install -r --frozen-lockfile
+
+    # The settings that SHAPE a deploy live in one block of package.json, where
+    # a change to them shows up in a pull request diff rather than in a settings
+    # page nobody can review. A resource prefix and a domain name; neither is
+    # sensitive, and both are already visible in the deployed hostnames.
+    #
+    # The account id is deliberately NOT here. It is not a password, but it is
+    # half of what an attacker needs: paired with a leaked token it names
+    # exactly what to spend. Keeping it out of a public repository means a
+    # leaked token on its own is not enough, which is worth one variable.
+    - name: Read Cloudflare settings
+      id: cloudflare
+      shell: bash
+      run: |
+        read_setting() {
+          jq -er ".cloudflare.$1 // empty" package.json 2>/dev/null || true
+        }
+
+        raw=$(read_setting resourcePrefix)
+        [ -z "$raw" ] && {
+          echo "::error::cloudflare.resourcePrefix is missing from package.json"
+          exit 1
+        }
+
+        # LOWERCASED AND VALIDATED, because this is not only a name — it becomes
+        # a DNS label. `<prefix>.example.com` is a hostname, and hostnames have
+        # rules a JSON string does not: letters, digits and dashes only, not
+        # starting or ending with a dash. "Skein" would otherwise produce names
+        # that look right in a log and a custom domain Cloudflare rejects,
+        # several minutes into a deploy.
+        prefix=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+        [ "$raw" != "$prefix" ] && echo "::notice::lowercased resource prefix '$raw' to '$prefix' — it is used as a DNS label"
+        if ! printf '%s' "$prefix" | grep -qE '^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'; then
+          echo "::error::cloudflare.resourcePrefix '$raw' cannot be used as a hostname. Use letters, digits and dashes only, not starting or ending with a dash."
+          exit 1
+        fi
+
+        # Optional. Without it production publishes on workers.dev like the
+        # previews do, which is a complete pipeline for a fork with no domain.
+        zone=$(read_setting productionZone)
+
+        {
+          echo "prefix=$prefix"
+          echo "production_zone=$zone"
+        } >> "$GITHUB_OUTPUT"
+        echo "prefix=$prefix  production zone=${zone:-none (workers.dev)}"

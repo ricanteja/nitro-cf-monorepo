@@ -1,0 +1,142 @@
+name: Pull request
+
+# The gate. Quality runs per project and in parallel; nothing is deployed until
+# all of it passes; the preview environment is created as one unit; and closing
+# the PR destroys it.
+#
+# Adding a project means three edits: an output in shared-filter-changes.yml, a
+# quality job here, and that job's name in the `needs` list of `gate`.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, closed]
+
+# A reusable workflow cannot request more than its caller grants, and GitHub
+# rejects the whole run at parse time when one does — a startup_failure with
+# zero jobs and no indication of which permission was missing. This must stay a
+# superset of every called workflow's `permissions:` block.
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  # One run per PR. A second push while the first is still deploying would
+  # otherwise race it onto the same worker names.
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  detect:
+    uses: ./.github/workflows/shared-filter-changes.yml
+
+  # Root-level files belong to no workspace package, so `pnpm -r` never reaches
+  # them — which meant the README, the most-read file here, was the one thing
+  # nothing checked. Cheap, so it runs unconditionally.
+  root-quality:
+    name: Quality (root)
+    needs: detect
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+      - name: Format
+        run: pnpm exec prettier --check .
+
+  packages-quality:
+    name: Quality
+    needs: detect
+    if: needs.detect.outputs.packages == 'true' && github.event.action != 'closed'
+    uses: ./.github/workflows/quality.yml
+    with:
+      name: preset
+      directory: packages/cloudflare-monorepo
+      prepare: pnpm build
+
+  web-quality:
+    name: Quality
+    needs: [detect, packages-quality]
+    if: |
+      always() &&
+      needs.detect.outputs.web == 'true' &&
+      needs.packages-quality.result != 'failure' &&
+      github.event.action != 'closed'
+    uses: ./.github/workflows/quality.yml
+    with:
+      name: web
+      directory: web
+      needs_preset: true
+      prepare: pnpm nuxt prepare
+
+  board-quality:
+    name: Quality
+    needs: [detect, packages-quality]
+    if: |
+      always() &&
+      needs.detect.outputs.board == 'true' &&
+      needs.packages-quality.result != 'failure' &&
+      github.event.action != 'closed'
+    uses: ./.github/workflows/quality.yml
+    with:
+      name: board
+      directory: services/board
+
+  imgman-quality:
+    name: Quality
+    needs: [detect, packages-quality]
+    if: |
+      always() &&
+      needs.detect.outputs.imgman == 'true' &&
+      needs.packages-quality.result != 'failure' &&
+      github.event.action != 'closed'
+    uses: ./.github/workflows/quality.yml
+    with:
+      name: imgman
+      directory: services/imgman
+
+  gate:
+    name: Quality gate
+    needs: [detect, root-quality, packages-quality, web-quality, board-quality, imgman-quality]
+    if: always() && github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      # `!contains(needs.*.result, 'failure')` alone would also pass when a job
+      # was cancelled, so cancellation is rejected explicitly.
+      #
+      # The expression goes through `env` rather than being interpolated into
+      # the script. Substituting ${{ }} directly into a shell line is how
+      # workflow injection happens, and it is worth being consistent about even
+      # where the values are a fixed set of job results.
+      - name: Check results
+        env:
+          RESULTS: ${{ join(needs.*.result, ',') }}
+        run: |
+          echo "upstream results: $RESULTS"
+          case "$RESULTS" in
+            *failure*) echo "::error::a quality check failed"; exit 1 ;;
+            *cancelled*) echo "::error::a quality check was cancelled"; exit 1 ;;
+          esac
+          echo "all quality checks passed or were skipped"
+
+  preview:
+    name: Preview
+    needs: [detect, gate]
+    if: |
+      always() &&
+      needs.gate.result == 'success' &&
+      needs.detect.outputs.deployable == 'true' &&
+      github.event.action != 'closed'
+    uses: ./.github/workflows/preview.yml
+    secrets: inherit
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+
+  cleanup:
+    name: Cleanup
+    needs: detect
+    if: github.event.action == 'closed'
+    uses: ./.github/workflows/cleanup.yml
+    secrets: inherit
+    with:
+      pr_number: ${{ github.event.pull_request.number }}

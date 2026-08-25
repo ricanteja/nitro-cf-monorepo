@@ -1,0 +1,36 @@
+# Nuxt / Nitro build output
+.output
+.nuxt
+.nitro
+.cache
+.data
+
+# Cloudflare / Wrangler
+.wrangler
+.mf
+.dev.vars
+dist
+
+# Dependencies
+node_modules/
+
+# Local env files. There are none to check in: this app takes no local
+# configuration — bindings come from wrangler.jsonc, and deploy-time values from
+# GitHub variables and secrets (see README.md § Deploying your own fork).
+.env
+.env.*
+
+# Logs
+*.log
+logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+
+# Test & coverage
+coverage/
+*.tsbuildinfo

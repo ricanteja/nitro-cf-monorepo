@@ -1,0 +1,87 @@
+/**
+ * imgman — native image work, behind a container.
+ *
+ * NOT PUBLICLY ROUTABLE. `workers_dev` is false in every deployed environment:
+ * nothing outside the account needs to reach this, and the web app talks to it
+ * over a service binding. That is least privilege, not a security control —
+ * the guards that matter live in container/server.mjs, next to the fetch they
+ * protect.
+ *
+ * Container sizing is deliberately minimal. Instances bill while they exist,
+ * and this repo is meant to be cheap to fork and run.
+ */
+{
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "skein-imgman-dev",
+    "main": "src/index.ts",
+    "compatibility_date": "2026-08-01",
+    "compatibility_flags": ["nodejs_compat"],
+    "observability": {
+        "enabled": true,
+    },
+    "containers": [
+        {
+            "class_name": "ImageContainer",
+            "image": "./container/Dockerfile",
+            "instance_type": "basic",
+            "max_instances": 1,
+        },
+    ],
+    "durable_objects": {
+        "bindings": [
+            {
+                "name": "IMAGES",
+                "class_name": "ImageContainer",
+            },
+        ],
+    },
+    "migrations": [
+        {
+            "tag": "v1",
+            "new_sqlite_classes": ["ImageContainer"],
+        },
+    ],
+    /* Derivatives are written here; the web app reads them back out. */
+    "r2_buckets": [
+        {
+            "binding": "R2",
+            "bucket_name": "skein-dev",
+        },
+    ],
+    "env": {
+        "pr-[[PR_NUM]]": {
+            "name": "ws-[[PREFIX]]-imgman-pr-[[PR_NUM]]",
+            "workers_dev": false,
+            "containers": [
+                {
+                    "name": "ws-[[PREFIX]]-imgman-pr-[[PR_NUM]]-image",
+                    "class_name": "ImageContainer",
+                    "image": "./container/Dockerfile",
+                    "instance_type": "basic",
+                    "max_instances": 1,
+                },
+            ],
+            "durable_objects": {
+                "bindings": [{ "name": "IMAGES", "class_name": "ImageContainer" }],
+            },
+            "r2_buckets": [{ "binding": "R2", "bucket_name": "r2-[[PREFIX]]-pr-[[PR_NUM]]" }],
+        },
+        "prod": {
+            "name": "ws-[[PREFIX]]-imgman-prod",
+            "workers_dev": false,
+            "containers": [
+                {
+                    "name": "ws-[[PREFIX]]-imgman-prod-image",
+                    "class_name": "ImageContainer",
+                    "image": "./container/Dockerfile",
+                    "instance_type": "basic",
+                    "max_instances": 1,
+                },
+            ],
+            "durable_objects": {
+                "bindings": [{ "name": "IMAGES", "class_name": "ImageContainer" }],
+            },
+            "r2_buckets": [{ "binding": "R2", "bucket_name": "r2-[[PREFIX]]-prod" }],
+        },
+    },
+}

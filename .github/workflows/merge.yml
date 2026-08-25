@@ -1,0 +1,30 @@
+name: Merge to main
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Never two production deploys at once, and do NOT cancel one in flight —
+  # a half-finished deploy is worse than a queued one.
+  group: production
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    uses: ./.github/workflows/shared-filter-changes.yml
+
+  deploy:
+    needs: detect
+    if: needs.detect.outputs.deployable == 'true'
+    uses: ./.github/workflows/deploy.yml
+    secrets: inherit
+    with:
+      # A change to the shared preset rebuilds and redeploys everything,
+      # because everything is built against it.
+      board: ${{ needs.detect.outputs.board == 'true' || needs.detect.outputs.packages == 'true' }}
+      imgman: ${{ needs.detect.outputs.imgman == 'true' || needs.detect.outputs.packages == 'true' }}
+      web: ${{ needs.detect.outputs.web == 'true' || needs.detect.outputs.packages == 'true' }}

@@ -1,0 +1,117 @@
+name: Filter project changes
+
+# Path-based change detection. Every other workflow keys off these outputs, so
+# a PR that only touches the README runs nothing expensive.
+#
+# NOTE the asymmetry between `quality` and `preview` further down the pipeline:
+# quality checks are PER PROJECT, because they are independent and fast
+# feedback matters. Preview environments are PER ENVIRONMENT — all three
+# workers deploy together — because web's bindings name the other two, so a
+# half-deployed preview cannot work at all.
+
+on:
+  workflow_call:
+    outputs:
+      packages:
+        value: ${{ jobs.detect.outputs.packages }}
+      web:
+        value: ${{ jobs.detect.outputs.web }}
+      board:
+        value: ${{ jobs.detect.outputs.board }}
+      imgman:
+        value: ${{ jobs.detect.outputs.imgman }}
+      deployable:
+        description: Any change that should produce or refresh a preview environment.
+        value: ${{ jobs.detect.outputs.deployable }}
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect changed projects
+    runs-on: ubuntu-latest
+    outputs:
+      packages: ${{ steps.filter.outputs.packages }}
+      web: ${{ steps.filter.outputs.web }}
+      board: ${{ steps.filter.outputs.board }}
+      imgman: ${{ steps.filter.outputs.imgman }}
+      deployable: ${{ steps.filter.outputs.deployable }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Determine base ref
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "ref=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect changed files
+        id: changed
+        run: |
+          BASE="${{ steps.base.outputs.ref }}"
+
+          # A base this runner cannot resolve is normal, not exceptional, and
+          # `git diff` answers it with `fatal: bad object` and exit 128 rather
+          # than an empty diff. Three ways it happens:
+          #
+          #   - a branch's first push, where `github.event.before` is all zeroes
+          #   - a FORCE-PUSH, where the previous head no longer exists
+          #   - a shallow clone that simply does not have that commit
+          #
+          # The force-push case is the one that bit: rewriting `main` to a
+          # single commit left `before` pointing at an object the runner could
+          # not fetch, and the whole pipeline failed on a repository whose files
+          # were perfectly fine.
+          #
+          # When the base cannot be resolved, treat EVERYTHING as changed. That
+          # is the safe direction — it deploys more than necessary rather than
+          # skipping a project that did change.
+          usable=""
+          if [ -n "$BASE" ] && [ "$BASE" != "0000000000000000000000000000000000000000" ]; then
+            git cat-file -e "${BASE}^{commit}" 2>/dev/null && usable=1
+          fi
+
+          if [ -n "$usable" ]; then
+            git diff --name-only "$BASE" HEAD > changed.txt
+          else
+            echo "::notice::no usable base commit (first push, force-push, or a shallow clone) — treating every file as changed"
+            git ls-files > changed.txt
+          fi
+          echo "Changed files:"
+          sed 's/^/  /' changed.txt
+
+      - name: Filter paths
+        id: filter
+        run: |
+          files=$(cat changed.txt)
+
+          check() {
+            if echo "$files" | grep -qE "$2"; then
+              echo "$1=true" >> "$GITHUB_OUTPUT"
+              echo "  $1: true"
+              return 0
+            fi
+            echo "$1=false" >> "$GITHUB_OUTPUT"
+            echo "  $1: false"
+            return 1
+          }
+
+          # Shared preset. Everything depends on it, so a change here means
+          # every project is rebuilt and revalidated.
+          check packages '^(packages/|pnpm-workspace\.yaml|pnpm-lock\.yaml|package\.json)' && shared=1 || shared=0
+
+          check web '^web/'    && w=1 || w=0
+          check board '^services/board/'     && b=1 || b=0
+          check imgman '^services/imgman/' && i=1 || i=0
+
+          if [ "$shared$w$b$i" != "0000" ]; then
+            echo "deployable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "deployable=false" >> "$GITHUB_OUTPUT"
+          fi

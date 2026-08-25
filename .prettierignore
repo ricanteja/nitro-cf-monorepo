@@ -1,0 +1,13 @@
+# Each workspace package formats itself (pnpm -r prettier:check), so the root
+# pass covers only the files that belong to no package — which is where the
+# README and the licences live. Without this the two passes would fight over
+# the same files with the same settings, slowly.
+node_modules
+packages
+web
+services
+pnpm-lock.yaml
+LICENSE-APACHE
+LICENSE-MIT
+NOTICE
+.wrangler

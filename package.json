@@ -1,0 +1,30 @@
+{
+    "name": "nitro-cf-monorepo",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "license": "MIT OR Apache-2.0",
+    "author": "Ricardo Tejada - Tenologik Ltd. Co.",
+    "cloudflare": {
+        "resourcePrefix": "skein",
+        "productionZone": "tenologik.com"
+    },
+    "scripts": {
+        "dev": "pnpm -F skein-web dev",
+        "build": "pnpm -F skein-web build",
+        "db:migrate": "pnpm -F skein-web db:migrate",
+        "seed": "pnpm -F skein-web seed",
+        "lint": "pnpm -r lint",
+        "lint:fix": "pnpm -r lint:fix",
+        "typecheck": "pnpm -r typecheck",
+        "prettier:check": "prettier --check . && pnpm -r prettier:check",
+        "prettier:write": "prettier --write . && pnpm -r prettier:write"
+    },
+    "engines": {
+        "node": ">=24"
+    },
+    "packageManager": "pnpm@10.28.2",
+    "devDependencies": {
+        "prettier": "^3.8.3"
+    }
+}

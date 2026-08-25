@@ -1,0 +1,287 @@
+name: Preview cleanup
+
+# Destroys a PR's preview environment when the PR closes.
+#
+# ORDER IS THE REVERSE OF CREATION. web holds the bindings that name board and
+# imgman, so it goes first; removing a Durable Object script that another live
+# worker still binds to is asking for trouble. Storage goes last, because a
+# worker that still exists and has lost its database is worse than one that is
+# simply gone.
+#
+# NOTHING HERE TOUCHES DNS. Previews publish on workers.dev, so a preview never
+# owns a Custom Domain, a certificate or a DNS record — only production does,
+# and production is not torn down.
+#
+# Nothing here aborts on the first failure. A stuck bucket must not prevent the
+# database being removed — but the job still fails at the end, because silent
+# cleanup failures are how you discover six months of orphaned resources on a
+# bill rather than in a log.
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup:
+    name: Destroy preview
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+        id: setup
+
+      - name: Delete workers
+        continue-on-error: true
+        id: workers
+        working-directory: web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          PREFIX: ${{ steps.setup.outputs.prefix }}
+          PR: ${{ inputs.pr_number }}
+        run: |
+          set -uo pipefail
+          failed=0
+          # web first: it binds the other two.
+          for NAME in "ws-${PREFIX}-web-pr-${PR}" "ws-${PREFIX}-board-pr-${PR}" "ws-${PREFIX}-imgman-pr-${PR}"; do
+            if OUT=$(pnpm --silent wrangler delete --name "$NAME" --force 2>&1); then
+              echo "::notice::deleted worker $NAME"
+            elif echo "$OUT" | grep -qiE 'not found|10007|workers.api.error.script_not_found'; then
+              echo "::notice::$NAME does not exist, nothing to remove"
+            else
+              echo "$OUT"
+              echo "::error::failed to delete worker $NAME"
+              failed=1
+            fi
+          done
+          exit $failed
+
+      - name: Delete R2 bucket
+        continue-on-error: true
+        id: r2
+        working-directory: web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          PREFIX: ${{ steps.setup.outputs.prefix }}
+          PR: ${{ inputs.pr_number }}
+        run: |
+          set -uo pipefail
+          NAME="r2-${PREFIX}-pr-${PR}"
+
+          # Distinguish "no such bucket" from "not allowed to look".
+          #
+          # Both answer `success: false`, and treating them the same reported a
+          # bucket as already gone when the truth was that the token could not
+          # see it — a teardown that leaks storage and says it succeeded.
+          CODE=$(curl -s -o /tmp/bucket.json -w '%{http_code}' \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${NAME}" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+          case "$CODE" in
+            200) : ;;
+            404)
+              echo "::notice::bucket $NAME does not exist, nothing to remove"
+              exit 0 ;;
+            401|403)
+              cat /tmp/bucket.json
+              echo "::error::not permitted to inspect bucket $NAME — the API token needs 'Account · Workers R2 Storage · Edit'. NOT treating this as already deleted."
+              exit 1 ;;
+            *)
+              cat /tmp/bucket.json
+              echo "::error::unexpected HTTP $CODE looking up bucket $NAME"
+              exit 1 ;;
+          esac
+
+          # Try the delete FIRST. An empty bucket is the ordinary case and
+          # needs no S3 credentials at all, so reaching for them unconditionally
+          # turns a working cleanup into one that fails on a missing secret.
+          if pnpm --silent wrangler r2 bucket delete "$NAME" 2>/dev/null; then
+            echo "::notice::deleted $NAME"
+            exit 0
+          fi
+
+          # Refused: almost always because objects remain, and R2 will not
+          # delete a bucket that has any.
+          #
+          # THIS USED TO SHELL OUT TO RCLONE, and rclone is not installed on a
+          # GitHub runner. The step failed with `rclone: command not found` and
+          # then printed an error blaming the API token for a 401 that had never
+          # happened — a bucket left behind, and a message pointing at the wrong
+          # thing. It had never run before, because it only runs when a preview
+          # actually has objects in it.
+          #
+          # The REST API lists and deletes objects directly, with the token this
+          # workflow already holds. No second credential to derive, no S3
+          # endpoint to configure, and nothing that has to be present on the
+          # runner. That API is rate limited and returns at most 1000 keys per
+          # page, which is the right trade for preview buckets holding a
+          # demo board's images; a preview measured in tens of thousands of
+          # objects would want the S3 API and a tool to drive it.
+          OBJECTS="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/r2/buckets/${NAME}/objects"
+          removed=0
+          while :; do
+            PAGE=$(curl -s "$OBJECTS" -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+            if ! echo "$PAGE" | jq -e '.success' >/dev/null 2>&1; then
+              echo "$PAGE"
+              echo "::error::could not list the objects in $NAME. Object operations on the REST API need an account-level token — 'Account · Workers R2 Storage · Edit'; a bucket-scoped R2 token is rejected here and only works against the S3 API."
+              exit 1
+            fi
+
+            COUNT=$(echo "$PAGE" | jq '.result | length')
+            [ "$COUNT" = "0" ] && break
+
+            # `@uri`, which encodes the slashes too. Verified against the API:
+            # a fully percent-encoded key deletes, and keys here contain both
+            # slashes and whatever else a filename can.
+            #
+            # THE BODY DECIDES, NOT THE STATUS. A delete of a key that is not
+            # there answers HTTP 200 with `success: false` and code 10007, so
+            # checking the status alone counts every failure as a success — and
+            # because the loop re-lists until the bucket is empty, that turns a
+            # permission problem into a job that spins until it times out.
+            deleted_this_pass=0
+            while read -r KEY; do
+              [ -z "$KEY" ] && continue
+              RESULT=$(curl -s -X DELETE "${OBJECTS}/${KEY}" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+              # 10007 is "no such key", which is the desired end state.
+              if echo "$RESULT" | jq -e '.success or (.errors[]?.code == 10007)' >/dev/null 2>&1; then
+                deleted_this_pass=$((deleted_this_pass + 1))
+                removed=$((removed + 1))
+              else
+                echo "$RESULT"
+                echo "::error::failed to delete an object from $NAME"
+                exit 1
+              fi
+            done <<< "$(echo "$PAGE" | jq -r '.result[].key | @uri')"
+
+            # A pass that removed nothing while the bucket still lists objects
+            # would repeat forever. Stop and say so instead.
+            if [ "$deleted_this_pass" = "0" ]; then
+              echo "::error::$NAME still lists $COUNT object(s) but a full pass deleted none. Stopping rather than looping."
+              exit 1
+            fi
+
+            # No cursor is followed. Deleting what was just listed shrinks the
+            # bucket, so the next unpaginated listing returns the next set —
+            # and a cursor taken before a delete would point into a listing
+            # that no longer exists.
+          done
+          echo "::notice::emptied $NAME ($removed object(s))"
+
+          if OUT=$(pnpm --silent wrangler r2 bucket delete "$NAME" 2>&1); then
+            echo "::notice::deleted $NAME"
+          elif echo "$OUT" | grep -q '10006'; then
+            echo "::notice::deleted $NAME (already gone)"
+          else
+            echo "$OUT"
+            echo "::error::failed to delete $NAME after emptying it"
+            exit 1
+          fi
+
+      # Deleting a Worker does NOT remove the container images it pushed, and
+      # image storage is capped at 50 GB per ACCOUNT — shared by every project
+      # in it. A repository that opens a few dozen pull requests against a
+      # container this size will hit that cap, and the failure surfaces as a
+      # deploy that cannot push rather than as anything mentioning storage.
+      #
+      # Best-effort by design, and the one step here that has not been run
+      # against a live account: `wrangler containers images list` prints for
+      # humans and its format is not a contract. So the raw listing is echoed
+      # before anything is parsed out of it — if the shape changes, the log says
+      # what it saw instead of silently matching nothing.
+      - name: Delete container images
+        continue-on-error: true
+        id: images
+        working-directory: web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          PREFIX: ${{ steps.setup.outputs.prefix }}
+          PR: ${{ inputs.pr_number }}
+        run: |
+          set -uo pipefail
+          IMAGE="ws-${PREFIX}-imgman-pr-${PR}-image"
+          LISTING=$(pnpm --silent wrangler containers images list 2>&1 || true)
+          echo "$LISTING"
+
+          # TWO WHITESPACE-SEPARATED COLUMNS, not `name:tag`.
+          #
+          #   ws-skein-imgman-pr-1-image               32aaa346
+          #
+          # This matched on `${IMAGE}:` for months, found nothing, reported
+          # "nothing to remove" and exited 0 — so the Report step below said
+          # `images success` while eight tags sat in the registry counting
+          # against the account's 50 GB. A silent leak in exactly the step whose
+          # job is to prevent one, which is why the raw listing is echoed above
+          # and why the count is reported below rather than only the failures.
+          TAGS=$(echo "$LISTING" | awk -v img="$IMAGE" '$1 == img { print $2 }' | sort -u)
+          if [ -z "$TAGS" ]; then
+            echo "::notice::no registry images matching ${IMAGE}, nothing to remove"
+            exit 0
+          fi
+
+          failed=0
+          removed=0
+          for TAG in $TAGS; do
+            # -y: this command PROMPTS for confirmation, and a prompt on a
+            # runner is a hang or a failure depending on how stdin behaves.
+            if OUT=$(pnpm --silent wrangler containers images delete -y "${IMAGE}:${TAG}" 2>&1); then
+              removed=$((removed + 1))
+            elif echo "$OUT" | grep -qiE 'not found|does not exist|404'; then
+              echo "::notice::${IMAGE}:${TAG} already gone"
+            else
+              echo "$OUT"
+              echo "::error::failed to delete image ${IMAGE}:${TAG}"
+              failed=1
+            fi
+          done
+          echo "::notice::deleted ${removed} image tag(s) for ${IMAGE}"
+          exit $failed
+
+      - name: Delete D1 database
+        continue-on-error: true
+        id: d1
+        working-directory: web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          PREFIX: ${{ steps.setup.outputs.prefix }}
+          PR: ${{ inputs.pr_number }}
+        run: |
+          set -uo pipefail
+          NAME="d1-${PREFIX}-pr-${PR}"
+          LIST=$(pnpm --silent wrangler d1 list --json 2>&1) || true
+          if ! echo "$LIST" | jq -e . >/dev/null 2>&1; then
+            echo "$LIST"
+            echo "::error::could not list D1 databases, so $NAME cannot be confirmed gone. A 10000 here means the API token is missing 'Account · D1 · Edit'."
+            exit 1
+          fi
+          ID=$(echo "$LIST" | jq -r --arg n "$NAME" '.[] | select(.name == $n) | .uuid')
+          if [ -z "$ID" ]; then
+            echo "::notice::database $NAME does not exist, nothing to remove"
+            exit 0
+          fi
+          pnpm --silent wrangler d1 delete "$NAME" --skip-confirmation
+          echo "::notice::deleted $NAME"
+
+      # Each step above is allowed to fail so the others still run. This is
+      # where that gets turned back into a red job.
+      - name: Report
+        run: |
+          fail=0
+          for r in "workers=${{ steps.workers.outcome }}" "images=${{ steps.images.outcome }}" "r2=${{ steps.r2.outcome }}" "d1=${{ steps.d1.outcome }}"; do
+            name=${r%%=*}; outcome=${r##*=}
+            printf '  %-8s %s\n' "$name" "$outcome"
+            [ "$outcome" = "success" ] || fail=1
+          done
+          if [ "$fail" = "1" ]; then
+            echo "::error::preview teardown left resources behind — check the steps above before they accumulate"
+            exit 1
+          fi
