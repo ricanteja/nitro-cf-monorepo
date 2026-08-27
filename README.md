@@ -75,6 +75,23 @@ pnpm dev                                        # http://localhost:3000
 The first visit makes a board and opens it. Afterwards `/` shows the library of
 boards you already have.
 
+### The whole thing in a hundred seconds
+
+[![Two browser windows side by side on the same board. Both show the same two
+photographs of Albert Einstein, each with a green box over the detected face
+labelled with his name, and a red dashed line drawn between the two cards. A
+toast reads "Found Albert Einstein in 1 other photograph(s)". One window shows
+the other person's cursor, and a note reading "Pretty smart guy" appears in
+both.](skein-demo-poster.jpg)](skein-demo.mp4)
+
+**[Watch the recording](skein-demo.mp4)** — a hundred silent seconds of notes,
+uploads, face matching, strings, the outline, search, and two windows editing
+the same board at once.
+
+That still is a single frame of it, and it is most of the pitch: name one face
+and the other photograph labels itself, the string between them is derived
+rather than drawn, and both windows are watching the same Durable Object.
+
 ### Seeing it work without doing anything
 
 With the dev server already running, in another terminal:
@@ -527,6 +544,17 @@ pull_request closed ──────────────────► cl
 push to main ──► detect changes ──► board + imgman ──► web
 ```
 
+![A comment posted by the workflow on a pull request, headed "Preview
+environment". It gives the preview URL, then a table of the five resources
+created for it — three workers, a D1 database and an R2 bucket — with a column
+saying which of them is reachable: the URL for web, "binding only" for board and
+imgman. Below the table, a line saying everything above is destroyed when the
+pull request closes.](skein-comment.png)
+
+Every pull request gets that comment, updated in place rather than appended, so
+a branch with twenty pushes has one comment showing the current state instead of
+twenty stale ones.
+
 **Quality is per project. Previews are per environment.** Quality checks are
 independent and fast feedback matters, so they run separately and in parallel.
 A preview cannot be partial: `web` names `board` in a `script_name` and reaches
@@ -842,6 +870,11 @@ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' https://<your-preview-h
 
 Every preview then inherits the policy automatically, including previews for
 pull requests opened later. Nothing in the pipeline changes.
+
+![A Cloudflare Access sign-in page for a preview hostname, asking for an email
+address to continue.](access.png)
+
+That is what anyone reaching a preview URL sees before the app loads.
 
 ### Access and the WebSocket
 
