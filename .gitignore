@@ -34,3 +34,6 @@ Thumbs.db
 # Test & coverage
 coverage/
 *.tsbuildinfo
+
+# The 1440p source recording. The committed demo is the compressed one.
+skein_demo.mp4
