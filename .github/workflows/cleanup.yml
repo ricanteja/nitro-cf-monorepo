@@ -185,6 +185,58 @@ jobs:
             exit 1
           fi
 
+      # A CONTAINER APPLICATION IS A THIRD RESOURCE, and deleting the Worker
+      # removes neither it nor the images below.
+      #
+      # It survives with LIVE INSTANCES attached, which bill while they exist,
+      # and it pins the durable object namespace it was created against. The way
+      # that surfaces is a deploy failing with "there is already an application
+      # with the name … associated with a different durable object namespace" —
+      # which only happens once a PR number is reused, so a repository can
+      # accumulate these for months and only find out when it restarts at PR 1.
+      #
+      # Deleted BEFORE the images, because an application holding an instance is
+      # using the image those tags point at.
+      - name: Delete container application
+        continue-on-error: true
+        id: container
+        working-directory: web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          PREFIX: ${{ steps.setup.outputs.prefix }}
+          PR: ${{ inputs.pr_number }}
+        run: |
+          set -uo pipefail
+          APP="ws-${PREFIX}-imgman-pr-${PR}-image"
+          LISTING=$(pnpm --silent wrangler containers list 2>&1 || true)
+          echo "$LISTING"
+
+          # A box-drawn table, so the columns are split on the border character
+          # and trimmed. Matched on the WHOLE name, not a prefix: a substring
+          # match on "…-pr-1-image" would also catch "…-pr-12-image".
+          ID=$(echo "$LISTING" | awk -F'│' -v app="$APP" '
+            NF > 2 {
+              id = $2; name = $3
+              gsub(/^[ \t]+|[ \t]+$/, "", id); gsub(/^[ \t]+|[ \t]+$/, "", name)
+              if (name == app) print id
+            }' | head -1)
+
+          if [ -z "$ID" ]; then
+            echo "::notice::no container application named ${APP}, nothing to remove"
+            exit 0
+          fi
+
+          if OUT=$(echo y | pnpm --silent wrangler containers delete "$ID" 2>&1); then
+            echo "::notice::deleted container application ${APP} (${ID})"
+          elif echo "$OUT" | grep -qiE 'not found|does not exist|404'; then
+            echo "::notice::${APP} already gone"
+          else
+            echo "$OUT"
+            echo "::error::failed to delete container application ${APP}"
+            exit 1
+          fi
+
       # Deleting a Worker does NOT remove the container images it pushed, and
       # image storage is capped at 50 GB per ACCOUNT — shared by every project
       # in it. A repository that opens a few dozen pull requests against a
@@ -276,7 +328,7 @@ jobs:
       - name: Report
         run: |
           fail=0
-          for r in "workers=${{ steps.workers.outcome }}" "images=${{ steps.images.outcome }}" "r2=${{ steps.r2.outcome }}" "d1=${{ steps.d1.outcome }}"; do
+          for r in "workers=${{ steps.workers.outcome }}" "container=${{ steps.container.outcome }}" "images=${{ steps.images.outcome }}" "r2=${{ steps.r2.outcome }}" "d1=${{ steps.d1.outcome }}"; do
             name=${r%%=*}; outcome=${r##*=}
             printf '  %-8s %s\n' "$name" "$outcome"
             [ "$outcome" = "success" ] || fail=1
