@@ -35,5 +35,8 @@ Thumbs.db
 coverage/
 *.tsbuildinfo
 
-# The 1440p source recording. The committed demo is the compressed one.
-skein_demo.mp4
+# Screen recordings. The README embeds skein-demo.gif, which is committed; the
+# mp4s a recording starts life as are not, because a repository keeps whatever
+# lands in it forever and a demo video is the first thing re-recorded when the
+# UI changes. Keep them somewhere else.
+*.mp4

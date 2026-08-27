@@ -77,20 +77,18 @@ boards you already have.
 
 ### The whole thing in a hundred seconds
 
-[![Two browser windows side by side on the same board. Both show the same two
-photographs of Albert Einstein, each with a green box over the detected face
-labelled with his name, and a red dashed line drawn between the two cards. A
-toast reads "Found Albert Einstein in 1 other photograph(s)". One window shows
-the other person's cursor, and a note reading "Pretty smart guy" appears in
-both.](skein-demo-poster.jpg)](skein-demo.mp4)
+![Two browser windows side by side on the same board, driven at once. Notes are
+typed and appear in both. Photographs are dropped in and come back with green
+boxes over the detected faces; naming one face labels the same person in the
+other photograph and a string is drawn between the two cards without anyone
+drawing it. Cards are dragged, resized and rotated, and every movement mirrors
+in the other window along with the other person's cursor.](skein-demo.gif)
 
-**[Watch the recording](skein-demo.mp4)** — a hundred silent seconds of notes,
-uploads, face matching, strings, the outline, search, and two windows editing
-the same board at once.
-
-That still is a single frame of it, and it is most of the pitch: name one face
-and the other photograph labels itself, the string between them is derived
-rather than drawn, and both windows are watching the same Durable Object.
+Notes, uploads, face matching, derived strings, the outline, search, and two
+windows editing the same board at once — the whole demo, silent, in a hundred
+seconds. Name one face and the other photograph labels itself; the string
+between them is derived rather than drawn; both windows are watching the same
+Durable Object.
 
 ### Seeing it work without doing anything
 
