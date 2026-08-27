@@ -86,9 +86,43 @@ function doing(peer: Peer): string {
               ? 'rotating something'
               : 'resizing something'
     }
-    if (peer.id === board.me?.id) return board.editable ? 'you can edit' : 'you are viewing'
+    // Your own row says so, because the name above it is an input rather than
+    // a "(you)" label — this is what marks which row is yours.
+    if (peer.id === board.me?.id) return board.editable ? 'you — can edit' : 'you — viewing'
     return peer.role === 'edit' ? 'can edit' : 'viewing'
 }
+/**
+ * Your own name, editable in place in the presence list.
+ *
+ * Seeded from `me` and re-seeded whenever it changes underneath — which happens
+ * on the first `welcome`, on a reconnect, and after the Durable Object trims
+ * what was typed. Guarded on focus so a presence broadcast arriving mid-edit
+ * does not overwrite what is being typed.
+ */
+const nameDraft = ref('')
+const nameInput = useTemplateRef<HTMLInputElement>('nameInput')
+
+watch(
+    () => board.me?.name,
+    (name) => {
+        if (name && document.activeElement !== nameInput.value) nameDraft.value = name
+    },
+    { immediate: true }
+)
+
+function commitName() {
+    // `renameSelf` answers false for an empty or unchanged name; either way the
+    // input goes back to showing the name the room knows, so an emptied field
+    // does not sit there looking like it saved.
+    if (!board.renameSelf(nameDraft.value)) nameDraft.value = board.me?.name ?? ''
+    nameInput.value?.blur()
+}
+
+function cancelName() {
+    nameDraft.value = board.me?.name ?? ''
+    nameInput.value?.blur()
+}
+
 const INK = ['#dc2626', '#d97706', '#16a34a', '#2563eb', '#7c3aed', '#475569', '#db2777', '#0891b2']
 
 const stickerOpen = ref(false)
@@ -289,8 +323,8 @@ const TABLES = [
             />
             <!-- Presence. The cluster says how many people are here; opening it
                  says who, which of them can edit, and what each is doing right
-                 now. It is also the only place you can learn your OWN name,
-                 which is generated rather than chosen. -->
+                 now — and lets you change your own name, which is generated on
+                 first visit rather than chosen. -->
             <UPopover v-if="board.peers.length">
                 <button
                     class="flex -space-x-1.5 rounded-full p-0.5 transition hover:bg-elevated"
@@ -329,11 +363,25 @@ const TABLES = [
                                     {{ initialsOf(peer.name) }}
                                 </span>
                                 <span class="min-w-0 flex-1">
-                                    <span class="block truncate text-sm text-highlighted">
+                                    <!-- Your own row is an input; everyone
+                                         else's is text. One row, two states,
+                                         rather than a separate settings field
+                                         for a name that is only meaningful
+                                         next to the people it distinguishes
+                                         you from. -->
+                                    <input
+                                        v-if="peer.id === board.me?.id"
+                                        ref="nameInput"
+                                        v-model="nameDraft"
+                                        :maxlength="board.MAX_NAME_LENGTH"
+                                        aria-label="Your name"
+                                        class="block w-full truncate rounded bg-transparent text-sm text-highlighted outline-none hover:bg-elevated focus:bg-elevated focus:ring-1 focus:ring-primary"
+                                        @blur="commitName"
+                                        @keydown.enter.prevent="commitName"
+                                        @keydown.escape.prevent="cancelName"
+                                    />
+                                    <span v-else class="block truncate text-sm text-highlighted">
                                         {{ peer.name }}
-                                        <span v-if="peer.id === board.me?.id" class="text-dimmed">
-                                            (you)
-                                        </span>
                                     </span>
                                     <span class="block text-[11px] text-muted">
                                         {{ doing(peer) }}
