@@ -105,6 +105,13 @@ const RECONNECT_DELAYS_MS = [500, 1_000, 2_000, 5_000, 10_000]
 /** How many steps back each person gets. Per session, never shared. */
 const HISTORY_LIMIT = 50
 
+/**
+ * Matches MAX_NAME_LENGTH in services/board — long enough for "Whimsical
+ * Wolverine 4821", short enough not to be a payload. Clamped here so the input
+ * stops you rather than the object silently truncating what you typed.
+ */
+const MAX_NAME_LENGTH = 40
+
 /** The layout fields a history entry has to restore. */
 export type Layout = Pick<
     Card,
@@ -395,6 +402,11 @@ export const useBoardStore = defineStore('board', () => {
                     break
                 case 'presence': {
                     peers.value = message.peers ?? []
+                    // `me` is set from `welcome` and never again, so a rename
+                    // would otherwise leave the toolbar showing the old name
+                    // to the one person who changed it.
+                    const mine = peers.value.find((p) => p.id === me.value?.id)
+                    if (mine && me.value) me.value = { ...me.value, name: mine.name }
                     // Anyone no longer in the room cannot have a pointer in it.
                     const here = new Set(peers.value.map((p) => p.id))
                     for (const id of cursors.value.keys()) {
@@ -487,6 +499,26 @@ export const useBoardStore = defineStore('board', () => {
 
     function send(payload: Record<string, unknown>): void {
         if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload))
+    }
+
+    /**
+     * Change your own display name.
+     *
+     * Sent over the socket rather than reconnecting with a new `?name=`, which
+     * would drop the session and reappear to everyone else as somebody leaving
+     * and a stranger arriving. The Durable Object trims and clamps it and
+     * broadcasts presence to everyone including us, so the name that lands in
+     * `me` is the one the room actually agreed on rather than the one typed.
+     *
+     * Persisted first, so it survives a reload even if the socket is down —
+     * which is also the case where it takes effect on the next connect.
+     */
+    function renameSelf(name: string): boolean {
+        const cleaned = name.trim().slice(0, MAX_NAME_LENGTH)
+        if (!cleaned || cleaned === me.value?.name) return false
+        if (import.meta.client) localStorage.setItem('skein:name', cleaned)
+        send({ type: 'rename', name: cleaned })
+        return true
     }
 
     /** Remembered per browser, so you are the same person when you come back. */
@@ -1086,6 +1118,8 @@ export const useBoardStore = defineStore('board', () => {
         close,
         load,
         rename,
+        renameSelf,
+        MAX_NAME_LENGTH,
         move,
         startGesture,
         endGesture,

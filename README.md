@@ -603,8 +603,17 @@ it. A repository opening a few dozen pull requests against a container this size
 will reach that cap, and the failure appears as a deploy that cannot push rather
 than as anything mentioning storage.
 
-Teardown therefore removes the PR's images as well as its workers, buckets and
-database. That step is best-effort: `wrangler containers images list` prints for
+**A container application is a third resource again**, distinct from both, and
+it is the one that bites rather than merely accumulating. It survives with live
+instances attached and pins the Durable Object namespace it was created
+against, so the failure is a later deploy refusing with _"there is already an
+application with the name … associated with a different durable object
+namespace"_ — which only happens once a pull request number is reused. A
+repository can carry these for months and only discover them when it restarts
+at PR 1.
+
+Teardown therefore removes the PR's container application and its images as
+well as its workers, buckets and database. That step is best-effort: `wrangler containers images list` prints for
 humans, and its format is not a contract — it once matched `name:tag` against a
 listing that is actually whitespace-separated columns, found nothing, and
 reported success while eight image tags accumulated. It echoes the raw listing before

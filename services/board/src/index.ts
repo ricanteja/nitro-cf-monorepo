@@ -542,6 +542,31 @@ export class BoardRoom extends DurableObject<Env> {
             return
         }
 
+        // Your own name.
+        //
+        // Handled ABOVE the editor check on purpose: a name is a fact about the
+        // person, not an edit to the board, and a viewer watching a session is
+        // exactly who most needs to say which of the two "Whimsical Wolverine"s
+        // they are. Nothing here writes to D1 — presence is session state and
+        // dies with the connection, the same as a cursor.
+        if (message.type === 'rename') {
+            const name = String(message.name ?? '')
+                .trim()
+                .slice(0, MAX_NAME_LENGTH)
+            if (!name) {
+                session.socket.send(
+                    JSON.stringify({ type: 'error', error: 'a name cannot be empty' })
+                )
+                return
+            }
+            session.name = name
+            // To everyone INCLUDING the sender, so one broadcast is the whole
+            // story: the renamer learns the clamped value rather than trusting
+            // what it optimistically set.
+            this.broadcast({ type: 'presence', peers: this.presence() })
+            return
+        }
+
         if (session.role !== 'edit') {
             session.socket.send(
                 JSON.stringify({ type: 'denied', reason: 'this link is view-only' })
